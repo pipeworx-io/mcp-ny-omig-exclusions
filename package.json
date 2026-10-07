@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-ny-omig-exclusions",
+  "version": "0.1.0",
+  "description": "New York State OMIG Medicaid provider exclusion screening — fleet #2788.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-ny-omig-exclusions": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "ny-omig-exclusions"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-ny-omig-exclusions.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-0fe7054e3b3c48d3598a20360252a308422697e7a2fde8bc69fed154945bdc4b",
+    "sourceCommit": "be47827ad0f444e813e7224db0489c4ea890a30e"
+  }
+}
