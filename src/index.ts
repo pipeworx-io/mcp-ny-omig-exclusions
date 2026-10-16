@@ -25,6 +25,112 @@ interface McpToolExport {
 }
 
 /**
+ * Shared "count records by a named date field over a year or range" helper —
+ * fleet #3170.
+ *
+ * WHY THIS EXISTS. Four baked-table packs (ny-omig-exclusions,
+ * tx-medical-exclusions, ca-medical-exclusions, fl-medical-exclusions) each
+ * hold thousands of rows and each had only a list-wide total — no way to
+ * answer "how many took effect in year Y" without a caller paging through
+ * every row itself. A benchmark probe (fleet #3170/#3149) asked exactly that
+ * question against two of them and both returned the SAME list-wide total on
+ * every one of 7-8 rounds; the model ran out of rounds and refused rather
+ * than get a wrong number. This is the one piece of that fix every pack
+ * shares: parsing `year` or `start_date`/`end_date` into an inclusive
+ * YYYY-MM-DD range, or a NAMED reason when the input can't be turned into
+ * one. It deliberately never returns a silent zero for a bad argument —
+ * root CLAUDE.md's silent-zero policy applies to a malformed count request
+ * exactly as it does to an upstream outage.
+ *
+ * WHAT IT DOES NOT DO. It does not touch the rows — each pack's own ISO date
+ * field (already YYYY-MM-DD in every one of these four) is filtered by plain
+ * string comparison, which is correct for YYYY-MM-DD strings and avoids a
+ * Date() parse / timezone trap entirely. Each pack is responsible for saying
+ * which of its own fields it counted (data varies: NY/TX/CA have exactly one
+ * exclusion-date field each; FL additionally splits "all sanction orders" vs
+ * "participation exclusions" within the matched range).
+ */
+
+interface DateRange {
+  /** Inclusive start date, YYYY-MM-DD. */
+  start: string;
+  /** Inclusive end date, YYYY-MM-DD. */
+  end: string;
+  /** Human label for the range, e.g. "2025" or "2024-06-01 to 2025-06-01". */
+  label: string;
+}
+
+interface DateRangeError {
+  error: string;
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Reads `args.year`, `args.start_date` and `args.end_date` and returns:
+ *   - `null` if none were passed (no date-range count was requested at all —
+ *     the caller should fall through to its normal, non-counting response);
+ *   - `{ error }` if something WAS passed but can't be turned into a valid
+ *     range (bad format, start after end, year out of a sane bound) — the
+ *     caller must surface this as a named reason, never as a zero count;
+ *   - `{ start, end, label }` otherwise.
+ *
+ * start_date/end_date, if either is present, take precedence over `year`
+ * (an explicit range is a more specific request than a calendar year).
+ */
+function parseYearOrDateRange(args: Record<string, unknown>): DateRange | DateRangeError | null {
+  const startRaw = typeof args.start_date === 'string' ? args.start_date.trim() : '';
+  const endRaw = typeof args.end_date === 'string' ? args.end_date.trim() : '';
+  const yearRaw = args.year;
+  const yearGiven = yearRaw !== undefined && yearRaw !== null && yearRaw !== '';
+
+  if (!startRaw && !endRaw && !yearGiven) return null;
+
+  if (startRaw || endRaw) {
+    if (!DATE_RE.test(startRaw) || !DATE_RE.test(endRaw)) {
+      return {
+        error:
+          `start_date and end_date must BOTH be present and in YYYY-MM-DD form ` +
+          `(got start_date=${startRaw ? JSON.stringify(startRaw) : '(missing)'}, end_date=${endRaw ? JSON.stringify(endRaw) : '(missing)'}).`,
+      };
+    }
+    if (startRaw > endRaw) {
+      return { error: `start_date (${startRaw}) is after end_date (${endRaw}).` };
+    }
+    return { start: startRaw, end: endRaw, label: startRaw === endRaw ? startRaw : `${startRaw} to ${endRaw}` };
+  }
+
+  const year = Math.floor(Number(yearRaw));
+  if (!Number.isFinite(year) || year < 1900 || year > 2100) {
+    return { error: `year must be a 4-digit calendar year between 1900 and 2100 (got ${JSON.stringify(yearRaw)}).` };
+  }
+  return { start: `${year}-01-01`, end: `${year}-12-31`, label: String(year) };
+}
+
+function isDateRangeError(r: DateRange | DateRangeError | null): r is DateRangeError {
+  return r != null && typeof (r as DateRangeError).error === 'string';
+}
+
+/** Inclusive YYYY-MM-DD membership test; `null`/empty dates never match. */
+function inRange(date: string | null | undefined, range: DateRange): boolean {
+  return Boolean(date) && (date as string) >= range.start && (date as string) <= range.end;
+}
+
+const DATE_RANGE_ARG_SCHEMA = {
+  year: {
+    type: 'number' as const,
+    description: 'Count records whose date field falls in this calendar year (e.g. 2025), counted over the WHOLE list, not a page. Ignored if start_date/end_date are given.',
+  },
+  start_date: {
+    type: 'string' as const,
+    description: 'Inclusive range start, YYYY-MM-DD. Use with end_date for a custom date range instead of a calendar year.',
+  },
+  end_date: {
+    type: 'string' as const,
+    description: 'Inclusive range end, YYYY-MM-DD. Use with start_date for a custom date range instead of a calendar year.',
+  },
+};
+/**
  * New York State OMIG Medicaid provider exclusion screening — fleet #2788.
  *
  * Beside the federal HHS OIG LEIE (mcps/leie) and the SAM federal exclusions
@@ -242,11 +348,48 @@ async function checkExclusion(args: Record<string, unknown>) {
   };
 }
 
-async function coverage() {
+async function coverage(args: Record<string, unknown>) {
   const withNpi = ROWS.filter((r) => r.npi).length;
   const withLicense = ROWS.filter((r) => r.license_number).length;
   const dates = ROWS.map((r) => r.excluded_since).filter((d): d is string => Boolean(d)).sort();
   const providerTypes = new Set(ROWS.map((r) => r.provider_type).filter(Boolean));
+
+  // fleet #3170: count-by-date-range mode. A benchmark probe found this tool
+  // returned the SAME list-wide total on every call when asked "how many
+  // exclusions took effect in 2025" — the model ran out of rounds with no
+  // way to get a real number. When year/start_date/end_date is passed,
+  // return the count FIRST (before any of the plain coverage fields below)
+  // and say plainly which date field was counted and over what range.
+  const range = parseYearOrDateRange(args);
+  if (isDateRangeError(range)) {
+    return {
+      found: false,
+      reason: 'invalid_date_range',
+      hint: range.error,
+      source: SOURCE_LABEL,
+      source_url: SOURCE_URL,
+      data_as_of: DATA_AS_OF,
+    };
+  }
+  if (range) {
+    const count = ROWS.filter((r) => inRange(r.excluded_since, range)).length;
+    return {
+      found: true,
+      mode: 'date_range_count',
+      count,
+      date_field_counted: 'excluded_since — OMIG\'s published exclusion effective date',
+      range: { start: range.start, end: range.end, label: range.label },
+      counted_over: 'the whole list (9,000+ rows), not a page',
+      total_exclusions_all_time: TOTAL_ROWS,
+      oldest_exclusion_date: dates[0] ?? null,
+      newest_exclusion_date: dates[dates.length - 1] ?? null,
+      data_as_of: DATA_AS_OF,
+      index_captured_at: CAPTURED_AT,
+      note: NO_REASON_CAVEAT,
+      source: SOURCE_LABEL,
+      source_url: SOURCE_URL,
+    };
+  }
 
   return {
     found: true,
@@ -284,8 +427,9 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'ny_omig_exclusion_coverage',
     description:
-      'What the NY OMIG Medicaid exclusion data covers and how current it is: total exclusions held, how many carry an NPI or license number, how many distinct provider types appear, the oldest and newest exclusion dates, and OMIG\'s own "data last updated" date for the copy this pack serves. Use to check the screening data is fresh enough to rely on before a compliance decision, and to see the one-line note on what OMIG does NOT publish (exclusion reason/authority). Sourced from NY OMIG, keyless.',
-    inputSchema: { type: 'object' as const, properties: {} },
+      'What the NY OMIG Medicaid exclusion data covers and how current it is: total exclusions held, how many carry an NPI or license number, how many distinct provider types appear, the oldest and newest exclusion dates, and OMIG\'s own "data last updated" date for the copy this pack serves. Use to check the screening data is fresh enough to rely on before a compliance decision, and to see the one-line note on what OMIG does NOT publish (exclusion reason/authority). '
+      + 'Pass year (e.g. 2025) or start_date/end_date to instead COUNT how many exclusions have an effective date in that year or range, counted over the whole ~9,100-row list, not a page — answers "how many NY OMIG exclusions took effect in 2025". The response names the date field counted (excluded_since, OMIG\'s exclusion effective date). Sourced from NY OMIG, keyless.',
+    inputSchema: { type: 'object' as const, properties: { ...DATE_RANGE_ARG_SCHEMA } },
   },
 ];
 
@@ -295,7 +439,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'ny_omig_check_exclusion':
       return checkExclusion(args);
     case 'ny_omig_exclusion_coverage':
-      return coverage();
+      return coverage(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
