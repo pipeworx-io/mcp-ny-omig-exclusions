@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-ny-omig-exclusions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "New York State OMIG Medicaid provider exclusion screening — fleet #2788.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "ny-omig-exclusions",
     "gatewaySlug": "ny-omig-exclusions",
-    "sourceHash": "v1-434ebf39953eeba0910d689b5f3809f4ac8e6c0b678add97ce86ae37544399a2",
-    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
+    "sourceHash": "v1-1b2265daa67868a97b02935ed97797e7e94a0380a40864776ee94fe82389602c",
+    "sourceCommit": "bed7faa04e7276899b5e3870ef11c98625371f2b"
   }
 }
